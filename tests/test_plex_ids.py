@@ -162,6 +162,8 @@ class PlexIdRouteTests(IsolatedAsyncioTestCase):
 
         response = await get_meta(
             http=http,
+            request=None,
+            cache=None,
             configuration=CONFIGURATION,
             stremio_type=StremioMediaType.movie,
             plex_id='plexio:rk-123',
@@ -179,6 +181,8 @@ class PlexIdRouteTests(IsolatedAsyncioTestCase):
         with self.assertRaises(HTTPException) as raised:
             await get_meta(
                 http=object(),
+                request=None,
+                cache=None,
                 configuration=CONFIGURATION,
                 stremio_type=StremioMediaType.movie,
                 plex_id='plexio:%2Fetc%2Fpasswd',

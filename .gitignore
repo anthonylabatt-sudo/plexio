@@ -13,3 +13,8 @@ frontend/node_modules
 frontend/dist
 diagnostics/
 *.bak-*
+data/
+.venv-test/
+test_ids
+*.log
+*.pid

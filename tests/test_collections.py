@@ -108,6 +108,8 @@ class CollectionCatalogTests(IsolatedAsyncioTestCase):
 
         catalog = await get_catalog(
             http=http,
+            request=None,
+            cache=None,
             configuration=configuration,
             stremio_type=StremioMediaType.movie,
             catalog_id='plexio-collection-1-42',
@@ -133,6 +135,8 @@ class CollectionCatalogTests(IsolatedAsyncioTestCase):
                 with self.assertRaises(HTTPException) as raised:
                     await get_catalog(
                         http=SimpleNamespace(),
+                        request=None,
+                        cache=None,
                         configuration=configuration,
                         stremio_type=media_type,
                         catalog_id=catalog_id,

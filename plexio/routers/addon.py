@@ -1,3 +1,4 @@
+import asyncio
 import logging
 from itertools import chain
 from time import perf_counter
@@ -55,6 +56,116 @@ from plexio.stream_cache import (
 router = APIRouter()
 router.dependencies.append(Depends(set_sentry_user))
 logger = logging.getLogger(__name__)
+
+# Stream pre-warm: resolve and cache /stream responses when a detail page is
+# requested, so the first Play press returns from cache. In-flight keys prevent
+# duplicate concurrent resolution for the same media.
+_stream_prewarm_in_flight: set[str] = set()
+_STREAM_PREWARM_CONCURRENCY = 4
+
+
+def _prewarm_warm_ids(
+    stremio_type: StremioMediaType, warm_ids: list[str]
+) -> list[str]:
+    """Bound the number of media pre-warmed per request (user-configurable).
+
+    Series warm the most recent episodes: the common Play press targets a
+    continuation episode at the newest end of a long-running show.
+    """
+    if stremio_type == StremioMediaType.series:
+        limit = settings.stream_prewarm_max_episodes
+        if limit <= 0:
+            return []
+        return warm_ids[-limit:]
+    limit = settings.stream_prewarm_catalog_items
+    if limit <= 0:
+        return []
+    return warm_ids[:limit]
+
+
+def _prewarm_catalog_allowed(catalog_id: str) -> bool:
+    """Pre-warm only small, curated catalogs to bound background traffic."""
+    allowed = {
+        item.strip()
+        for item in settings.stream_prewarm_catalogs.split(',')
+        if item.strip()
+    }
+    return catalog_id in allowed
+
+
+def _catalog_prewarm_targets(
+    stremio_type: StremioMediaType,
+    on_deck_items: list[dict] | None,
+    configured_sections: set[str],
+    metas: list,
+) -> list[tuple[StremioMediaType, str]]:
+    """Pick bounded pre-warm targets for a catalog response.
+
+    On-deck catalogs warm each row's exact next-up episode (the raw on-deck
+    items ARE the in-progress episodes) plus movie rows. Non-on-deck catalogs
+    warm movie rows only, bounded by the configured caps.
+    """
+    if stremio_type == StremioMediaType.movie:
+        return [
+            (stremio_type, item.id)
+            for item in metas[: settings.stream_prewarm_catalog_items]
+            if item.id
+        ]
+    if stremio_type == StremioMediaType.series and on_deck_items is not None:
+        targets: list[tuple[StremioMediaType, str]] = []
+        for item in on_deck_items:
+            if item.get('type') != 'episode':
+                continue
+            section = str(item.get('librarySectionID', ''))
+            if configured_sections and section not in configured_sections:
+                continue
+            key = item.get('ratingKey')
+            if key:
+                targets.append((stremio_type, f'plexio:rk-{key}'))
+        return targets[: settings.stream_prewarm_max_episodes]
+    return []
+
+
+def _schedule_stream_prewarm(
+    *,
+    http,
+    cache,
+    configuration: AddonConfiguration,
+    namespace: str,
+    stremio_type: StremioMediaType,
+    warm_ids: list[str],
+    config_path: str,
+    play_prefix: str | None,
+) -> None:
+    """Schedule background /stream pre-warm tasks when enabled."""
+    if not settings.stream_prewarm:
+        return []
+    if settings.stream_cache_ttl <= 0:
+        return []
+    warm_ids = [
+        media_id
+        for media_id in _prewarm_warm_ids(stremio_type, warm_ids)
+        if media_id
+    ]
+    if not warm_ids:
+        return []
+    semaphore = asyncio.Semaphore(_STREAM_PREWARM_CONCURRENCY)
+    return [
+        asyncio.create_task(
+            _warm_stream_cache(
+                http=http,
+                cache=cache,
+                configuration=configuration,
+                namespace=namespace,
+                stremio_type=stremio_type,
+                media_id=media_id,
+                config_path=config_path,
+                play_prefix=play_prefix,
+                semaphore=semaphore,
+            ),
+        )
+        for media_id in warm_ids
+    ]
 
 RECENT_SORT = 'Date Added (desc)'
 
@@ -323,7 +434,9 @@ async def get_manifest(
     response_model_exclude_none=True,
 )
 async def get_catalog(
+    request: Request,
     http: Annotated[ClientSession, Depends(get_http_client)],
+    cache: Annotated[Redis, Depends(get_cache)],
     configuration: Annotated[AddonConfiguration, Depends(get_addon_configuration)],
     stremio_type: StremioMediaType,
     catalog_id: str,
@@ -338,12 +451,14 @@ async def get_catalog(
         skip = max(int(extras.get('skip', 0)), 0)
     except (TypeError, ValueError):
         skip = 0
+    on_deck_items = None
     if catalog_id == 'plexio-ondeck':
         items = await get_on_deck(
             client=http,
             url=configuration.discovery_url,
             token=configuration.access_token,
         )
+        on_deck_items = items
         metas = await _map_on_deck(http, items, configuration, stremio_type)
     elif catalog_id == 'plexio-recent':
         metas = await _recently_added(http, configuration, stremio_type, skip)
@@ -378,7 +493,33 @@ async def get_catalog(
             sort=extras.get('sort', 'Title'),
         )
         metas = [m.to_stremio_meta_review(configuration) for m in media]
-    return StremioCatalog(metas=metas)
+    result = StremioCatalog(metas=metas)
+
+    if settings.stream_prewarm and _prewarm_catalog_allowed(catalog_id):
+        config_path = ''
+        play_prefix = None
+        if _uses_playback_proxy(configuration):
+            config_path = request.url.path.split('/catalog/')[0]
+            play_prefix = f'{_public_base_url(request)}{config_path}/play'
+        targets = _catalog_prewarm_targets(
+            stremio_type=stremio_type,
+            on_deck_items=on_deck_items,
+            configured_sections={
+                s.key for s in _sections_of_type(configuration, stremio_type)
+            },
+            metas=result.metas,
+        )
+        _schedule_stream_prewarm(
+            http=http,
+            cache=cache,
+            configuration=configuration,
+            namespace=configuration_cache_namespace(configuration),
+            stremio_type=stremio_type,
+            warm_ids=[media_id for _, media_id in targets],
+            config_path=config_path,
+            play_prefix=play_prefix,
+        )
+    return result
 
 
 @router.get(
@@ -390,7 +531,9 @@ async def get_catalog(
     response_model_exclude_none=True,
 )
 async def get_meta(
+    request: Request,
     http: Annotated[ClientSession, Depends(get_http_client)],
+    cache: Annotated[Redis, Depends(get_cache)],
     configuration: Annotated[AddonConfiguration, Depends(get_addon_configuration)],
     stremio_type: StremioMediaType,
     plex_id: str,
@@ -433,7 +576,91 @@ async def get_meta(
             key=media.key,
         )
         meta.videos = [e.to_stremio_video_meta(configuration) for e in episodes]
-    return StremioMetaResponse(meta=meta)
+
+    result = StremioMetaResponse(meta=meta)
+
+    if settings.stream_prewarm:
+        config_path = ''
+        play_prefix = None
+        if _uses_playback_proxy(configuration):
+            config_path = request.url.path.split('/meta/')[0]
+            play_prefix = f'{_public_base_url(request)}{config_path}/play'
+        if stremio_type == StremioMediaType.series:
+            videos = meta.videos or []
+            warm_ids = [videos[-1].id] if videos else []
+        else:
+            warm_ids = [meta.id]
+        _schedule_stream_prewarm(
+            http=http,
+            cache=cache,
+            configuration=configuration,
+            namespace=configuration_cache_namespace(configuration),
+            stremio_type=stremio_type,
+            warm_ids=warm_ids,
+            config_path=config_path,
+            play_prefix=play_prefix,
+        )
+    return result
+
+
+async def _warm_stream_cache(
+    *,
+    http,
+    cache,
+    configuration,
+    namespace: str,
+    stremio_type: StremioMediaType,
+    media_id: str,
+    config_path: str,
+    play_prefix: str | None,
+    semaphore: asyncio.Semaphore,
+) -> None:
+    if settings.stream_cache_ttl <= 0:
+        return
+    stream_key = resource_cache_key(
+        namespace,
+        'stream',
+        f'{stremio_type.value}:{media_id}:{config_path}',
+    )
+    if stream_key in _stream_prewarm_in_flight:
+        return
+    async with semaphore:
+        if stream_key in _stream_prewarm_in_flight:
+            return
+        if await cache_get(cache, stream_key) is not None:
+            return
+        _stream_prewarm_in_flight.add(stream_key)
+        try:
+            media = await _resolve_stream_media(
+                http=http,
+                cache=cache,
+                configuration=configuration,
+                namespace=namespace,
+                stremio_type=stremio_type,
+                media_id=media_id,
+            )
+            result = StremioStreamsResponse(
+                streams=chain.from_iterable(
+                    meta.get_stremio_streams(configuration, play_prefix)
+                    for meta in media
+                ),
+            )
+            await cache_set(
+                cache,
+                stream_key,
+                serialize_stream_response(result, configuration.access_token),
+                ttl=settings.stream_cache_ttl,
+            )
+            logger.info(
+                'Stream prewarm type=%s media_id=%s streams=%d',
+                stremio_type.value,
+                media_id,
+                len(result.streams),
+            )
+        except Exception:
+            logger.exception('Stream prewarm failed for media_id=%s', media_id)
+        finally:
+            _stream_prewarm_in_flight.discard(stream_key)
 
 
 async def _resolve_rating_key_stream_media(

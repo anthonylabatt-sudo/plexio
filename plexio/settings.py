@@ -29,6 +29,10 @@ class Settings(BaseSettings):
     plex_match_cache_ttl: int = Field(default=86_400, ge=0, le=2_592_000)
     plex_metadata_cache_ttl: int = Field(default=300, ge=0, le=86_400)
     stream_cache_ttl: int = Field(default=300, ge=0, le=86_400)
+    stream_prewarm: bool = Field(default=False)
+    stream_prewarm_max_episodes: int = Field(default=12, ge=0, le=500)
+    stream_prewarm_catalog_items: int = Field(default=5, ge=0, le=50)
+    stream_prewarm_catalogs: str = 'plexio-ondeck,plexio-recent'
     plex_matching_token: str | None = None
     # Public-facing URL behind a reverse proxy or tunnel. The configure page
     # falls back to window.location.origin when this is unset.

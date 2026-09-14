@@ -603,6 +603,34 @@ async def get_meta(
     return result
 
 
+async def _prewarm_transcode_sessions(
+    *, http, configuration, streams
+) -> None:
+    """Start Plex universal transcode sessions for emitted transcode streams.
+
+    Hitting a transcoded stream's `start.m3u8` URL makes Plex begin transcoding
+    immediately, so the first Play press after the detail page is served by an
+    already-running transcode session. Only 7.1 EAC3 (Dolby Digital Plus) audio
+    is routed to transcode by this server; the kick is limited to the transcode
+    URLs plexio itself emits.
+    """
+    token = configuration.access_token
+    for stream in streams:
+        stream_url = getattr(stream, 'url', None)
+        if not stream_url or '/video/:/transcode/universal/start.m3u8' not in stream_url:
+            continue
+        if token and token not in stream_url and 'X-Plex-Token=' not in stream_url:
+            continue
+        try:
+            async with http.get(stream_url, timeout=settings.plex_requests_timeout) as response:
+                await response.read()
+            logger.info('Prewarmed Plex transcode session for %s', stream_url)
+        except Exception:
+            logger.warning(
+                'Plex transcode prewarm failed for %s', stream_url, exc_info=True
+            )
+
+
 async def _warm_stream_cache(
     *,
     http,
@@ -645,6 +673,12 @@ async def _warm_stream_cache(
                     for meta in media
                 ),
             )
+            if settings.eac3_71_transcode:
+                await _prewarm_transcode_sessions(
+                    http=http,
+                    configuration=configuration,
+                    streams=result.streams,
+                )
             await cache_set(
                 cache,
                 stream_key,

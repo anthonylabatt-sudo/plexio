@@ -33,6 +33,12 @@ class Settings(BaseSettings):
     stream_prewarm_max_episodes: int = Field(default=12, ge=0, le=500)
     stream_prewarm_catalog_items: int = Field(default=5, ge=0, le=50)
     stream_prewarm_catalogs: str = 'plexio-ondeck,plexio-recent'
+    # Route EAC3 (Dolby Digital Plus) 7.1 audio through Plex transcoding:
+    # suppress the direct stream and emit a transcode URL. Clients that can't
+    # decode EAC3/Atmos still get playable audio, and the Plex transcode session
+    # is pre-warmed so Play starts near-instantly. Sources without EAC3 7.1 keep
+    # direct play only (no transcode variants are emitted).
+    eac3_71_transcode: bool = Field(default=False)
     plex_matching_token: str | None = None
     # Public-facing URL behind a reverse proxy or tunnel. The configure page
     # falls back to window.location.origin when this is unset.

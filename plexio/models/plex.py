@@ -10,6 +10,7 @@ from plexio.models.utils import (
     rating_key_to_plexio_id,
     to_camel,
 )
+from plexio.settings import settings
 
 
 class Resolution(str, Enum):
@@ -183,6 +184,40 @@ def _audio_labels(media, streams):
         if codec:
             labels.append(codec)
     return ' / '.join(labels) or None
+
+
+def _channel_is_7_1(stream):
+    """True when the audio stream is a true 7.1 channel layout.
+
+    Prefers the explicit layout field so EAC3-Atmos (5.1 + JOC objects,
+    reported as 8 channels) is NOT misread as 7.1. Falls back to the channel
+    count only when no layout is reported.
+    """
+    layout = stream.get('audioChannelLayout') or stream.get('channelLayout')
+    if layout:
+        return str(layout).strip().upper().startswith('7.1')
+    try:
+        channels = int(stream.get('channels') or 0)
+    except (TypeError, ValueError):
+        return False
+    return channels == 8
+
+
+def _is_eac3_71(streams):
+    """True when any audio stream is EAC3 (Dolby Digital Plus) 7.1.
+
+    Only codec 'eac3' with a 7.1 channel layout counts. EAC3 5.1, Atmos-JOC
+    5.1, and other codecs stay direct play.
+    """
+    for stream in streams:
+        if stream.get('streamType') != 2:
+            continue
+        codec = _codec_label(stream.get('codec'), AUDIO_CODEC_LABELS)
+        if codec != 'E-AC-3':
+            continue
+        if _channel_is_7_1(stream):
+            return True
+    return False
 
 
 def _bitrate_label(media, part):
@@ -442,6 +477,7 @@ class PlexMediaMeta(BaseModel):
         from plexio.models.stremio import StremioStream
 
         streams = []
+        eac3_71_routing = bool(settings.eac3_71_transcode)
         for i, media in sorted(enumerate(self.media), key=_playback_priority):
             name = f'{configuration.server_name} {self.library_section_title}'
             part = media['Part'][0]
@@ -451,6 +487,7 @@ class PlexMediaMeta(BaseModel):
             resolution = _resolution_label(media)
             resolution_suffix = f' {resolution}' if resolution else ''
             source_details = _source_details(media, part, part_streams)
+            eac3_forced = eac3_71_routing and _is_eac3_71(part_streams)
 
             audio_languages = set()
             subtitles_languages = set()
@@ -467,7 +504,7 @@ class PlexMediaMeta(BaseModel):
                     if 'key' in part_stream:
                         subtitle_streams.append(part_stream)
 
-            if getattr(configuration, 'include_direct_play', True):
+            if getattr(configuration, 'include_direct_play', True) and not eac3_forced:
                 connections = getattr(
                     configuration,
                     'direct_play_connections',
@@ -548,7 +585,9 @@ class PlexMediaMeta(BaseModel):
                     'X-Plex-Token': configuration.access_token,
                 }
             )
-            if configuration.include_transcode_original:
+            if (eac3_71_routing and eac3_forced) or (
+                not eac3_71_routing and configuration.include_transcode_original
+            ):
                 quality_description = f'Transcode{resolution_suffix} · Original'
                 streams.append(
                     StremioStream(
@@ -575,7 +614,9 @@ class PlexMediaMeta(BaseModel):
                     ),
                 )
 
-            if configuration.include_transcode_down:
+            if configuration.include_transcode_down and (
+                not eac3_71_routing or eac3_forced
+            ):
                 for quality in configuration.transcode_down_qualities:
                     quality_params = RESOLUTION_QUALITY_PARAMS[quality]
                     if media['width'] <= quality_params['min_width']:

@@ -24,6 +24,11 @@ class FakeConfiguration:
 
 
 STREAM = {'url': 'http://x', 'name': 'Test', 'description': 'test'}
+TRANSCODE_STREAM = {
+    'url': 'http://plex.example:32400/video/:/transcode/universal/start.m3u8?path=/lib/1&X-Plex-Token=tok',
+    'name': 'Test',
+    'description': 'transcode',
+}
 
 
 class FakeMedia:
@@ -54,6 +59,7 @@ class StreamPrewarmTests(unittest.TestCase):
         'stream_prewarm_catalog_items',
         'stream_prewarm_catalogs',
         'stream_cache_ttl',
+        'eac3_71_transcode',
     )
 
     def setUp(self) -> None:
@@ -330,6 +336,91 @@ class StreamPrewarmTests(unittest.TestCase):
 
         self.assertEqual(self._run(scenario()), [])
         self.assertEqual(cache._store, {})
+
+    def test_warm_kicks_transcode_session_when_enabled(self):
+        settings.stream_prewarm = True
+        settings.eac3_71_transcode = True
+        cache = FakeCache()
+
+        class FakeResponse:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *exc):
+                return False
+
+            async def read(self):
+                return b'#EXTM3U'
+
+        http = mock.Mock()
+        http.get = mock.Mock(return_value=FakeResponse())
+        media = FakeMedia([TRANSCODE_STREAM])
+
+        async def scenario():
+            resolve = mock.AsyncMock(return_value=[media])
+            patcher = mock.patch.object(addon, '_resolve_stream_media', new=resolve)
+            with patcher:
+                tasks = addon._schedule_stream_prewarm(
+                    **{
+                        **schedule_kwargs(cache),
+                        'http': http,
+                    }
+                )
+                await asyncio.gather(*tasks)
+
+        self._run(scenario())
+        self.assertEqual(http.get.call_count, 1)
+        url = http.get.call_args[0][0]
+        self.assertIn('/video/:/transcode/universal/start.m3u8', url)
+        self.assertEqual(set(cache._store), {self._warm_key('plexio:rk-1')})
+
+    def test_warm_skips_transcode_kick_when_disabled(self):
+        settings.stream_prewarm = True
+        settings.eac3_71_transcode = False
+        cache = FakeCache()
+        http = mock.Mock()
+        http.get = mock.Mock()
+        media = FakeMedia([TRANSCODE_STREAM])
+
+        async def scenario():
+            resolve = mock.AsyncMock(return_value=[media])
+            patcher = mock.patch.object(addon, '_resolve_stream_media', new=resolve)
+            with patcher:
+                tasks = addon._schedule_stream_prewarm(
+                    **{
+                        **schedule_kwargs(cache),
+                        'http': http,
+                    }
+                )
+                await asyncio.gather(*tasks)
+
+        self._run(scenario())
+        http.get.assert_not_called()
+        self.assertEqual(set(cache._store), {self._warm_key('plexio:rk-1')})
+
+    def test_warm_kick_failure_is_swallowed(self):
+        settings.stream_prewarm = True
+        settings.eac3_71_transcode = True
+        cache = FakeCache()
+        http = mock.AsyncMock(side_effect=RuntimeError('nope'))
+        media = FakeMedia([TRANSCODE_STREAM])
+
+        async def scenario():
+            resolve = mock.AsyncMock(return_value=[media])
+            patcher = mock.patch.object(addon, '_resolve_stream_media', new=resolve)
+            with patcher:
+                with mock.patch.object(addon.logger, 'warning'):
+                    tasks = addon._schedule_stream_prewarm(
+                        **{
+                            **schedule_kwargs(cache),
+                            'http': http,
+                        }
+                    )
+                    await asyncio.gather(*tasks)
+                    return list(addon._stream_prewarm_in_flight)
+
+        self.assertEqual(self._run(scenario()), [])
+        self.assertEqual(set(cache._store), {self._warm_key('plexio:rk-1')})
 
 
 if __name__ == '__main__':

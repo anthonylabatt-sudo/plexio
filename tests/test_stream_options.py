@@ -4,7 +4,8 @@ from unittest import TestCase
 from yarl import URL
 
 from plexio.models.addon import PlexConnectionKind
-from plexio.models.plex import PlexMediaMeta
+from plexio.models.plex import PlexMediaMeta, _is_eac3_71
+from plexio.settings import settings
 
 
 def media():
@@ -188,3 +189,119 @@ class StreamOptionTests(TestCase):
             'Audio: Unknown · Subtitles: Unknown',
         )
         self.assertIsNone(stream.behavior_hints.video_size)
+
+
+def eac3_71_media():
+    item = media()
+    item.media[0]['Part'][0]['Stream'] = [
+        {
+            'streamType': 2,
+            'codec': 'eac3',
+            'channels': 8,
+            'audioChannelLayout': '7.1',
+            'languageTag': 'en',
+        }
+    ]
+    return item
+
+
+def aac_51_media():
+    item = media()
+    item.media[0]['Part'][0]['Stream'] = [
+        {
+            'streamType': 2,
+            'codec': 'aac',
+            'channels': 6,
+            'audioChannelLayout': '5.1',
+            'languageTag': 'en',
+        }
+    ]
+    return item
+
+
+class Eac3RoutingTests(TestCase):
+    def setUp(self) -> None:
+        self._saved = settings.eac3_71_transcode
+
+    def tearDown(self) -> None:
+        settings.eac3_71_transcode = self._saved
+
+    def test_eac3_71_detected_exact_layout(self):
+        self.assertTrue(
+            _is_eac3_71(
+                [
+                    {
+                        'streamType': 2,
+                        'codec': 'eac3',
+                        'channels': 8,
+                        'audioChannelLayout': '7.1',
+                    }
+                ]
+            )
+        )
+
+    def test_eac3_71_detected_channel_count_fallback(self):
+        self.assertTrue(
+            _is_eac3_71(
+                [
+                    {
+                        'streamType': 2,
+                        'codec': 'EAC3',
+                        'channels': 8,
+                    }
+                ]
+            )
+        )
+
+    def test_eac3_71_not_eac3_codec(self):
+        self.assertFalse(
+            _is_eac3_71([{'streamType': 2, 'codec': 'truehd', 'channels': 8}])
+        )
+
+    def test_eac3_71_not_7_1_layout(self):
+        self.assertFalse(
+            _is_eac3_71(
+                [
+                    {
+                        'streamType': 2,
+                        'codec': 'eac3',
+                        'channels': 6,
+                        'audioChannelLayout': '5.1',
+                    }
+                ]
+            )
+        )
+
+    def test_eac3_71_ignores_non_audio_streams(self):
+        self.assertFalse(_is_eac3_71([]))
+
+    def test_routing_off_preserves_direct_play(self):
+        settings.eac3_71_transcode = False
+        streams = eac3_71_media().get_stremio_streams(configuration())
+        self.assertEqual(len(streams), 2)
+        self.assertIn('Direct Play', streams[0].description)
+
+    def test_eac3_71_routes_to_transcode_only(self):
+        settings.eac3_71_transcode = True
+        streams = eac3_71_media().get_stremio_streams(configuration())
+        self.assertEqual(len(streams), 1)
+        self.assertIn('Transcode 1080p · Original', streams[0].description)
+        self.assertIn('/video/:/transcode/universal/start.m3u8', streams[0].url)
+        self.assertNotIn('Direct Play', streams[0].description)
+
+    def test_non_eac3_71_stays_direct_only_when_routing_on(self):
+        settings.eac3_71_transcode = True
+        streams = aac_51_media().get_stremio_streams(configuration())
+        self.assertEqual(len(streams), 2)
+        self.assertIn('Direct Play', streams[0].description)
+        for stream in streams:
+            self.assertNotIn('transcode/universal/start.m3u8', stream.url)
+
+    def test_routing_on_still_honors_include_transcode_original_for_eac3(self):
+        settings.eac3_71_transcode = True
+        streams = eac3_71_media().get_stremio_streams(
+            configuration(include_transcode_original=True)
+        )
+        urls = [s.url for s in streams]
+        self.assertEqual(len(streams), 1)
+        self.assertIn('Original', streams[0].description)

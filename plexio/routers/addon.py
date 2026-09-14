@@ -44,7 +44,7 @@ from plexio.plex.media_server_api import (
     stremio_to_plex_id,
 )
 from plexio.plex.playback import b64decode_path, proxy_playback
-from plexio.settings import settings
+from plexio.settings import server_is_optimized, settings
 from plexio.stream_cache import (
     cache_get,
     cache_set,
@@ -509,7 +509,11 @@ async def get_catalog(
         metas = [m.to_stremio_meta_review(configuration) for m in media]
     result = StremioCatalog(metas=metas)
 
-    if settings.stream_prewarm and _prewarm_catalog_allowed(catalog_id):
+    if (
+        settings.stream_prewarm
+        and _prewarm_catalog_allowed(catalog_id)
+        and server_is_optimized(configuration.server_name)
+    ):
         config_path = ''
         play_prefix = None
         if _uses_playback_proxy(configuration):
@@ -593,7 +597,7 @@ async def get_meta(
 
     result = StremioMetaResponse(meta=meta)
 
-    if settings.stream_prewarm:
+    if settings.stream_prewarm and server_is_optimized(configuration.server_name):
         config_path = ''
         play_prefix = None
         if _uses_playback_proxy(configuration):
@@ -757,7 +761,10 @@ async def _warm_stream_cache(
                     for meta in media
                 ),
             )
-            if settings.eac3_71_transcode:
+            if (
+                settings.eac3_71_transcode
+                and server_is_optimized(configuration.server_name)
+            ):
                 await _prewarm_transcode_sessions(
                     http=http,
                     configuration=configuration,

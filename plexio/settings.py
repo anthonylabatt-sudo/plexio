@@ -39,6 +39,11 @@ class Settings(BaseSettings):
     # is pre-warmed so Play starts near-instantly. Sources without EAC3 7.1 keep
     # direct play only (no transcode variants are emitted).
     eac3_71_transcode: bool = Field(default=False)
+    # Stream pre-warm and EAC3 7.1 transcode routing apply ONLY to addon configs
+    # whose server name is listed here (comma-separated). Devices running the
+    # Veyro app push the "VΞYRO" profile; any other client sharing the Plex
+    # server keeps plain behavior. Empty disables these optimizations for all.
+    optimization_server_names: str = 'VΞYRO'
     plex_matching_token: str | None = None
     # Public-facing URL behind a reverse proxy or tunnel. The configure page
     # falls back to window.location.origin when this is unset.
@@ -73,6 +78,17 @@ class Settings(BaseSettings):
         if not self.allowed_hosts:
             return []
         return [host.strip() for host in self.allowed_hosts.split(',') if host.strip()]
+
+
+def server_is_optimized(server_name: str | None) -> bool:
+    if not server_name:
+        return False
+    names = [
+        name.strip()
+        for name in settings.optimization_server_names.split(',')
+        if name.strip()
+    ]
+    return server_name.strip() in names
 
 
 settings = Settings()

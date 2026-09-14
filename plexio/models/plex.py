@@ -10,7 +10,7 @@ from plexio.models.utils import (
     rating_key_to_plexio_id,
     to_camel,
 )
-from plexio.settings import settings
+from plexio.settings import server_is_optimized, settings
 
 
 class Resolution(str, Enum):
@@ -477,7 +477,10 @@ class PlexMediaMeta(BaseModel):
         from plexio.models.stremio import StremioStream
 
         streams = []
-        eac3_71_routing = bool(settings.eac3_71_transcode)
+        eac3_71_routing = (
+            bool(settings.eac3_71_transcode)
+            and server_is_optimized(configuration.server_name)
+        )
         for i, media in sorted(enumerate(self.media), key=_playback_priority):
             name = f'{configuration.server_name} {self.library_section_title}'
             part = media['Part'][0]

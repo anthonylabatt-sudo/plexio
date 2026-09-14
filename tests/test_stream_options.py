@@ -35,7 +35,7 @@ def media():
 
 def configuration(**overrides):
     values = {
-        'server_name': 'Home',
+        'server_name': 'VΞYRO',
         'streaming_url': URL('https://primary.plex.direct:32400'),
         'direct_play_connections': [
             (URL('https://primary.plex.direct:32400'), PlexConnectionKind.remote),
@@ -296,6 +296,14 @@ class Eac3RoutingTests(TestCase):
         self.assertIn('Direct Play', streams[0].description)
         for stream in streams:
             self.assertNotIn('transcode/universal/start.m3u8', stream.url)
+
+    def test_eac3_71_routing_skipped_for_non_optimized_server(self):
+        settings.eac3_71_transcode = True
+        streams = eac3_71_media().get_stremio_streams(
+            configuration(server_name='Media Server')
+        )
+        self.assertEqual(len(streams), 2)
+        self.assertIn('Direct Play', streams[0].description)
 
     def test_routing_on_still_honors_include_transcode_original_for_eac3(self):
         settings.eac3_71_transcode = True

@@ -21,6 +21,7 @@ class FakeCache:
 
 class FakeConfiguration:
     access_token = 'test-token'
+    server_name = 'VΞYRO'
 
 
 STREAM = {'url': 'http://x', 'name': 'Test', 'description': 'test'}
@@ -60,6 +61,7 @@ class StreamPrewarmTests(unittest.TestCase):
         'stream_prewarm_catalogs',
         'stream_cache_ttl',
         'eac3_71_transcode',
+        'optimization_server_names',
     )
 
     def setUp(self) -> None:
@@ -514,6 +516,19 @@ class StreamPrewarmTests(unittest.TestCase):
         self.assertEqual(
             addon._split_next_up('plexio:nextup-42'), ('42', None)
         )
+
+    def test_optimizations_gated_by_configured_server_name(self):
+        self.assertTrue(addon.server_is_optimized('VΞYRO'))
+        self.assertFalse(addon.server_is_optimized('Media Server'))
+        self.assertFalse(addon.server_is_optimized(''))
+        self.assertFalse(addon.server_is_optimized(None))
+
+        settings.optimization_server_names = 'VΞYRO, Home'
+        try:
+            self.assertTrue(addon.server_is_optimized(' Home '))
+            self.assertFalse(addon.server_is_optimized('Other'))
+        finally:
+            settings.optimization_server_names = 'VΞYRO'
 
     def test_transcode_cap_limits_kicks_per_warm_cycle(self):
         settings.stream_prewarm = True

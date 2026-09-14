@@ -38,6 +38,7 @@ from plexio.plex.media_server_api import (
     get_collection_media,
     get_media,
     get_media_by_rating_key,
+    get_next_up_episode,
     get_on_deck,
     get_section_media,
     stremio_to_plex_id,
@@ -60,8 +61,19 @@ logger = logging.getLogger(__name__)
 # Stream pre-warm: resolve and cache /stream responses when a detail page is
 # requested, so the first Play press returns from cache. In-flight keys prevent
 # duplicate concurrent resolution for the same media.
+#
+# Series detail pages warm the show's exact continue-watching episode first: the
+# sentinel below is pre-resolved by _warm_stream_cache to the real episode id
+# (which is also the cache key the device will hit) before any Plex lookup for
+# the stream happens.
+_NEXT_UP_PREFIX = 'plexio:nextup-'
 _stream_prewarm_in_flight: set[str] = set()
 _STREAM_PREWARM_CONCURRENCY = 4
+# At most this many Plex transcode sessions are started by a single pre-warm
+# cycle (catalog or detail load). Every 7.1-EAC3 row would otherwise kick its
+# own real Plex transcode; the cap keeps the shelf warm from spawning a batch of
+# abandoned transcodes on the Plex server.
+_TRANSCODE_PREWARM_CAP = 1
 
 
 def _prewarm_warm_ids(
@@ -150,6 +162,7 @@ def _schedule_stream_prewarm(
     if not warm_ids:
         return []
     semaphore = asyncio.Semaphore(_STREAM_PREWARM_CONCURRENCY)
+    transcode_budget = [_TRANSCODE_PREWARM_CAP]
     return [
         asyncio.create_task(
             _warm_stream_cache(
@@ -162,6 +175,7 @@ def _schedule_stream_prewarm(
                 config_path=config_path,
                 play_prefix=play_prefix,
                 semaphore=semaphore,
+                transcode_budget=transcode_budget,
             ),
         )
         for media_id in warm_ids
@@ -587,7 +601,16 @@ async def get_meta(
             play_prefix = f'{_public_base_url(request)}{config_path}/play'
         if stremio_type == StremioMediaType.series:
             videos = meta.videos or []
-            warm_ids = [videos[-1].id] if videos else []
+            show_rk = media.rating_key if media and media.rating_key else ''
+            if show_rk and videos:
+                # Exactly one episode per show is warmed: the continue-watching
+                # next-up, falling back to the newest episode when the show has
+                # no in-progress entry.
+                warm_ids = [f'{_NEXT_UP_PREFIX}{show_rk}|{videos[-1].id}']
+            elif videos:
+                warm_ids = [videos[-1].id]
+            else:
+                warm_ids = []
         else:
             warm_ids = [meta.id]
         _schedule_stream_prewarm(
@@ -604,7 +627,7 @@ async def get_meta(
 
 
 async def _prewarm_transcode_sessions(
-    *, http, configuration, streams
+    *, http, configuration, streams, transcode_budget
 ) -> None:
     """Start Plex universal transcode sessions for emitted transcode streams.
 
@@ -613,7 +636,14 @@ async def _prewarm_transcode_sessions(
     already-running transcode session. Only 7.1 EAC3 (Dolby Digital Plus) audio
     is routed to transcode by this server; the kick is limited to the transcode
     URLs plexio itself emits.
+
+    `transcode_budget` is a shared single-element counter for the whole pre-warm
+    cycle: the first stream that still has budget starts its session and spends
+    the cap, so a catalog load never spawns more than the configured number of
+    real Plex transcodes (default 1) across all its rows.
     """
+    if not transcode_budget or transcode_budget[0] <= 0:
+        return
     token = configuration.access_token
     for stream in streams:
         stream_url = getattr(stream, 'url', None)
@@ -621,6 +651,7 @@ async def _prewarm_transcode_sessions(
             continue
         if token and token not in stream_url and 'X-Plex-Token=' not in stream_url:
             continue
+        transcode_budget[0] -= 1
         try:
             async with http.get(stream_url, timeout=settings.plex_requests_timeout) as response:
                 await response.read()
@@ -629,6 +660,43 @@ async def _prewarm_transcode_sessions(
             logger.warning(
                 'Plex transcode prewarm failed for %s', stream_url, exc_info=True
             )
+        break
+
+
+def _split_next_up(media_id: str) -> tuple[str, str | None]:
+    """Split `plexio:nextup-<show rk>` into `(show rk, fallback id | None)`."""
+    payload = media_id[len(_NEXT_UP_PREFIX):]
+    if '|' not in payload:
+        return payload, None
+    show_rk, fallback = payload.rsplit('|', 1)
+    return show_rk, fallback or None
+
+
+async def get_next_up_media_id(
+    *,
+    http,
+    cache,
+    configuration,
+    namespace: str,
+    stremio_type: StremioMediaType,
+    media_id: str,
+) -> str | None:
+    """Resolve a `plexio:nextup-<show rk>` sentinel to the real episode id.
+
+    Returns the continue-watching episode id when Plex has one; otherwise the
+    embedded fallback id (the show's newest episode); None only when neither
+    exists (warm aborts).
+    """
+    show_rating_key, fallback = _split_next_up(media_id)
+    episode = await get_next_up_episode(
+        client=http,
+        url=configuration.discovery_url,
+        token=configuration.access_token,
+        show_rating_key=show_rating_key,
+    )
+    if not episode:
+        return fallback
+    return f'plexio:rk-{episode}'
 
 
 async def _warm_stream_cache(
@@ -642,9 +710,25 @@ async def _warm_stream_cache(
     config_path: str,
     play_prefix: str | None,
     semaphore: asyncio.Semaphore,
+    transcode_budget: list[int],
 ) -> None:
     if settings.stream_cache_ttl <= 0:
         return
+    if media_id.startswith(_NEXT_UP_PREFIX):
+        # Resolve the continue-watching sentinel to the real episode id BEFORE
+        # computing the cache key, so the device's actual /stream URL is the one
+        # warmed. The sentinel carries the newest-episode fallback for shows
+        # with no in-progress entry.
+        media_id = await get_next_up_media_id(
+            http=http,
+            cache=cache,
+            configuration=configuration,
+            namespace=namespace,
+            stremio_type=stremio_type,
+            media_id=media_id,
+        )
+        if not media_id:
+            return
     stream_key = resource_cache_key(
         namespace,
         'stream',
@@ -678,6 +762,7 @@ async def _warm_stream_cache(
                     http=http,
                     configuration=configuration,
                     streams=result.streams,
+                    transcode_budget=transcode_budget,
                 )
             await cache_set(
                 cache,

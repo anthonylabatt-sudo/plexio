@@ -309,6 +309,7 @@ class StreamPrewarmTests(unittest.TestCase):
                     'config_path': '',
                     'play_prefix': None,
                     'semaphore': asyncio.Semaphore(4),
+                    'transcode_budget': [addon._TRANSCODE_PREWARM_CAP],
                 }
                 first = asyncio.create_task(addon._warm_stream_cache(**kwargs))
                 second = asyncio.create_task(addon._warm_stream_cache(**kwargs))
@@ -402,7 +403,19 @@ class StreamPrewarmTests(unittest.TestCase):
         settings.stream_prewarm = True
         settings.eac3_71_transcode = True
         cache = FakeCache()
-        http = mock.AsyncMock(side_effect=RuntimeError('nope'))
+
+        class FailingResponse:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *exc):
+                return False
+
+            async def read(self):
+                raise RuntimeError('nope')
+
+        http = mock.Mock()
+        http.get = mock.Mock(return_value=FailingResponse())
         media = FakeMedia([TRANSCODE_STREAM])
 
         async def scenario():
@@ -421,6 +434,127 @@ class StreamPrewarmTests(unittest.TestCase):
 
         self.assertEqual(self._run(scenario()), [])
         self.assertEqual(set(cache._store), {self._warm_key('plexio:rk-1')})
+
+    def test_warm_resolves_next_up_sentinel_to_real_episode_key(self):
+        settings.stream_prewarm = True
+        cache = FakeCache()
+        media = FakeMedia([STREAM])
+        kwargs = {
+            **schedule_kwargs(cache),
+            'stremio_type': addon.StremioMediaType.series,
+            'warm_ids': ['plexio:nextup-42|plexio:rk-9'],
+        }
+
+        async def scenario():
+            resolve = mock.AsyncMock(return_value=[media])
+            next_up = mock.AsyncMock(return_value='plexio:rk-7')
+            patcher = mock.patch.object(addon, '_resolve_stream_media', new=resolve)
+            with patcher, mock.patch.object(
+                addon, 'get_next_up_media_id', new=next_up
+            ):
+                tasks = addon._schedule_stream_prewarm(**kwargs)
+                await asyncio.gather(*tasks)
+            return resolve.call_args_list
+
+        calls = self._run(scenario())
+        # sentinel was resolved to the real episode id (the device's /stream key),
+        # and exactly one episode per show is warmed -- no second task for the
+        # latest episode when a next-up exists
+        self.assertEqual(
+            set(cache._store), {self._warm_key('plexio:rk-7', 'series')}
+        )
+        self.assertEqual([call.kwargs['media_id'] for call in calls], ['plexio:rk-7'])
+
+    def test_warm_aborts_when_sentinel_resolves_to_nothing(self):
+        settings.stream_prewarm = True
+        cache = FakeCache()
+        media = FakeMedia([STREAM])
+        kwargs = {
+            **schedule_kwargs(cache),
+            'stremio_type': addon.StremioMediaType.series,
+            'warm_ids': ['plexio:nextup-42|plexio:rk-9'],
+        }
+
+        async def scenario():
+            resolve = mock.AsyncMock(return_value=[media])
+            next_up = mock.AsyncMock(return_value=None)
+            patcher = mock.patch.object(addon, '_resolve_stream_media', new=resolve)
+            with patcher, mock.patch.object(
+                addon, 'get_next_up_media_id', new=next_up
+            ):
+                tasks = addon._schedule_stream_prewarm(**kwargs)
+                await asyncio.gather(*tasks)
+            return resolve.call_args_list
+
+        calls = self._run(scenario())
+        self.assertEqual(set(cache._store), set())
+        self.assertEqual(calls, [])
+
+    def test_next_up_media_id_falls_back_to_newest_episode(self):
+        async def scenario():
+            with mock.patch.object(
+                addon, 'get_next_up_episode', new=mock.AsyncMock(return_value=None)
+            ):
+                return await addon.get_next_up_media_id(
+                    http=mock.Mock(),
+                    cache=FakeCache(),
+                    configuration=mock.Mock(),
+                    namespace='n',
+                    stremio_type=addon.StremioMediaType.series,
+                    media_id='plexio:nextup-42|plexio:rk-9',
+                )
+
+        self.assertEqual(self._run(scenario()), 'plexio:rk-9')
+
+    def test_split_next_up(self):
+        self.assertEqual(
+            addon._split_next_up('plexio:nextup-42|plexio:rk-9'),
+            ('42', 'plexio:rk-9'),
+        )
+        self.assertEqual(
+            addon._split_next_up('plexio:nextup-42'), ('42', None)
+        )
+
+    def test_transcode_cap_limits_kicks_per_warm_cycle(self):
+        settings.stream_prewarm = True
+        settings.eac3_71_transcode = True
+
+        class FakeResponse:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *exc):
+                return False
+
+            async def read(self):
+                return b'#EXTM3U'
+
+        cache = FakeCache()
+        http = mock.Mock()
+        http.get = mock.Mock(return_value=FakeResponse())
+        media = FakeMedia([TRANSCODE_STREAM])
+        kwargs = {
+            **schedule_kwargs(cache),
+            'stremio_type': addon.StremioMediaType.series,
+            'warm_ids': ['plexio:rk-1', 'plexio:rk-2', 'plexio:rk-3'],
+        }
+
+        async def scenario():
+            resolve = mock.AsyncMock(return_value=[media])
+            patcher = mock.patch.object(addon, '_resolve_stream_media', new=resolve)
+            with patcher:
+                tasks = addon._schedule_stream_prewarm(
+                    **{**kwargs, 'http': http}
+                )
+                await asyncio.gather(*tasks)
+
+        self._run(scenario())
+        # three 7.1-triggering rows share one transcode budget: one kick total
+        self.assertEqual(http.get.call_count, 1)
+        for i in (1, 2, 3):
+            self.assertIn(
+                self._warm_key(f'plexio:rk-{i}', 'series'), cache._store
+            )
 
 
 if __name__ == '__main__':

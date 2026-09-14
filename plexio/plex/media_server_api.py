@@ -151,6 +151,39 @@ async def get_on_deck(
     return json['MediaContainer'].get('Metadata', [])
 
 
+async def get_next_up_episode(
+    *,
+    client: ClientSession,
+    url: URL,
+    token: str,
+    show_rating_key: str,
+) -> str | None:
+    """Return the rating key of the show's exact continue-watching target.
+
+    Plex's global On Deck list is a mix of in-progress movies and, for shows
+    with a watched/partial history, the next-up episode. The first episode-row
+    belonging to the show is precisely the episode the Play press would hit, so
+    it is the single highest-value stream to pre-warm. Returns None when the
+    show has no in-progress or next-up episode (fresh, never-started series).
+    """
+    json = await get_json(
+        client=client,
+        url=url / 'library/onDeck',
+        params={
+            'includeGuids': 1,
+            'X-Plex-Token': token,
+        },
+    )
+    show_rk = str(show_rating_key)
+    for item in json['MediaContainer'].get('Metadata', []):
+        if (
+            item.get('type') == 'episode'
+            and str(item.get('grandparentRatingKey', '')) == show_rk
+        ):
+            return str(item.get('ratingKey'))
+    return None
+
+
 def _server_cache_namespace(url: URL, token: str) -> str:
     return hashlib.sha256(f'{url}\0{token}'.encode()).hexdigest()
 

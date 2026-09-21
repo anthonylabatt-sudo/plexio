@@ -29,19 +29,81 @@ def before_send(event, hint):
 sentry_sdk.init(before_send=before_send)
 
 
+import asyncio
+
+
+async def _periodic_prewarm(plex_client, cache, sessions):
+    """Periodically pre-warm main sections/collections for all sessions."""
+    while True:
+        try:
+            await asyncio.sleep(1500)  # 25 minutes (just before 30-min cache TTL)
+            if sessions is None:
+                continue
+            # Get all active sessions
+            session_list = await sessions.list()
+            if not session_list:
+                continue
+            for session_info in session_list:
+                session_id = session_info['session_id']
+                try:
+                    config = await sessions.get_config(session_id)
+                    if config is None:
+                        continue
+                    base_url = "http://127.0.0.1:7777"
+                    # Critical catalogs only: on-deck, recent, 3 main sections
+                    critical_catalogs = [
+                        ("movie", "plexio-ondeck"),
+                        ("movie", "plexio-recent"),
+                        ("movie", "3"),
+                        ("series", "plexio-ondeck"),
+                        ("series", "plexio-recent"),
+                        ("series", "4"),
+                        ("series", "5"),
+                    ]
+                    for ctype, cid in critical_catalogs:
+                        try:
+                            async with plex_client.get(
+                                f"{base_url}/{session_id}/catalog/{ctype}/{cid}.json",
+                                timeout=aiohttp.ClientTimeout(total=15),
+                            ) as r:
+                                pass
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+        except asyncio.CancelledError:
+            break
+        except Exception:
+            pass
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    connector = aiohttp.TCPConnector(
+        limit=8,
+        keepalive_timeout=30,
+    )
     plex_client = aiohttp.ClientSession(
         headers={'accept': 'application/json'},
+        connector=connector,
     )
     cache = init_cache(settings)
     sessions = await init_sessions(settings)
+
+    # Start periodic pre-warm task
+    prewarm_task = asyncio.create_task(_periodic_prewarm(plex_client, cache, sessions))
 
     yield {
         'plex_client': plex_client,
         'cache': cache,
         'sessions': sessions,
     }
+
+    prewarm_task.cancel()
+    try:
+        await prewarm_task
+    except asyncio.CancelledError:
+        pass
 
     await plex_client.close()
     await cache.close()

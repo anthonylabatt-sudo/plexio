@@ -3,6 +3,7 @@ import unittest
 from types import SimpleNamespace
 from unittest import mock
 
+from plexio.models.stremio import StremioMetaPreview
 from plexio.routers import addon
 from plexio.settings import settings
 
@@ -516,6 +517,143 @@ class StreamPrewarmTests(unittest.TestCase):
         self.assertEqual(
             addon._split_next_up('plexio:nextup-42'), ('42', None)
         )
+
+    def test_search_targets_bounds_filters_and_gates(self):
+        metas = [SimpleNamespace(id=f'plexio:rk-{i}') for i in range(12)]
+        targets = addon._search_prewarm_targets(
+            addon.StremioMediaType.movie, 'mayday', metas
+        )
+        self.assertEqual(len(targets), addon._SEARCH_PREWARM_ITEMS)
+        self.assertEqual(
+            [mid for _, mid in targets],
+            [f'plexio:rk-{i}' for i in range(addon._SEARCH_PREWARM_ITEMS)],
+        )
+
+        mixed = [SimpleNamespace(id=''), SimpleNamespace(id='plexio:rk-1')]
+        self.assertEqual(
+            addon._search_prewarm_targets(addon.StremioMediaType.movie, 'x', mixed),
+            [(addon.StremioMediaType.movie, 'plexio:rk-1')],
+        )
+
+        # series searches and blank search terms yield nothing
+        self.assertEqual(
+            addon._search_prewarm_targets(
+                addon.StremioMediaType.series, 'mayday', metas
+            ),
+            [],
+        )
+        self.assertEqual(
+            addon._search_prewarm_targets(
+                addon.StremioMediaType.movie, '', metas
+            ),
+            [],
+        )
+
+    def test_get_catalog_search_triggers_prewarm(self):
+        settings.stream_prewarm = True
+        settings.stream_cache_ttl = 300
+        cache = FakeCache()
+        configuration = SimpleNamespace(
+            server_name='VΞYRO',
+            access_token='tok',
+            discovery_url='http://plex',
+            configured_collections=[],
+            report_playback=False,
+            proxy_streams=False,
+        )
+        request = SimpleNamespace(url=SimpleNamespace(path='/s/catalog/'))
+        http = object()
+
+        class FakeMetaRow:
+            def __init__(self, mid):
+                self._mid = mid
+
+            def to_stremio_meta_review(self, configuration):
+                return StremioMetaPreview(
+                    id=self._mid,
+                    type=addon.StremioMediaType.movie,
+                    name='M',
+                )
+
+        rows = [FakeMetaRow(f'plexio:rk-{i}') for i in range(10)]
+
+        async def scenario():
+            with mock.patch.object(
+                addon,
+                'get_section_media',
+                new=mock.AsyncMock(return_value=rows),
+            ), mock.patch.object(
+                addon,
+                '_schedule_stream_prewarm',
+                new=mock.Mock(return_value=[]),
+            ) as schedule:
+                result = await addon.get_catalog(
+                    request=request,
+                    http=http,
+                    cache=cache,
+                    configuration=configuration,
+                    stremio_type=addon.StremioMediaType.movie,
+                    catalog_id='3',
+                    extra='search=mayday',
+                )
+                return result, schedule
+
+        result, schedule = self._run(scenario())
+        self.assertEqual(len(result.metas), 10)
+        self.assertEqual(schedule.call_count, 1)
+        warm_ids = schedule.call_args.kwargs['warm_ids']
+        self.assertEqual(
+            warm_ids,
+            [f'plexio:rk-{i}' for i in range(addon._SEARCH_PREWARM_ITEMS)],
+        )
+
+    def test_get_catalog_browse_does_not_search_prewarm(self):
+        settings.stream_prewarm = True
+        settings.stream_cache_ttl = 300
+        cache = FakeCache()
+        configuration = SimpleNamespace(
+            server_name='VΞYRO',
+            access_token='tok',
+            discovery_url='http://plex',
+            configured_collections=[],
+            report_playback=False,
+            proxy_streams=False,
+        )
+        request = SimpleNamespace(url=SimpleNamespace(path='/s/catalog/'))
+        http = object()
+
+        class FakeMetaRow:
+            def to_stremio_meta_review(self, configuration):
+                return StremioMetaPreview(
+                    id='plexio:rk-1',
+                    type=addon.StremioMediaType.movie,
+                    name='M',
+                )
+
+        async def scenario():
+            with mock.patch.object(
+                addon,
+                'get_section_media',
+                new=mock.AsyncMock(return_value=[FakeMetaRow()]),
+            ), mock.patch.object(
+                addon,
+                '_schedule_stream_prewarm',
+                new=mock.Mock(return_value=[]),
+            ) as schedule:
+                # plain browse with no search term, non-allowlisted section
+                await addon.get_catalog(
+                    request=request,
+                    http=http,
+                    cache=cache,
+                    configuration=configuration,
+                    stremio_type=addon.StremioMediaType.movie,
+                    catalog_id='3',
+                    extra='',
+                )
+                return schedule
+
+        schedule = self._run(scenario())
+        self.assertEqual(schedule.call_count, 0)
 
     def test_optimizations_gated_by_configured_server_name(self):
         self.assertTrue(addon.server_is_optimized('VΞYRO'))

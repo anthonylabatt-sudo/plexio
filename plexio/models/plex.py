@@ -241,7 +241,7 @@ def _number(value, default=0):
 
 
 def _playback_priority(indexed_media):
-    """Prefer broadly compatible, moderate-size versions for faster startup."""
+    """Prefer smallest file size for fastest startup."""
     original_index, media = indexed_media
     parts = media.get('Part') or [{}]
     part = parts[0]
@@ -263,7 +263,6 @@ def _playback_priority(indexed_media):
     container_rank = {'mp4': 0, 'm4v': 0, 'mkv': 1}.get(container, 2)
     bitrate = _number(media.get('bitrate') or part.get('bitrate'))
     size = _number(part.get('size'))
-    is_heavy = bitrate > HIGH_BITRATE_THRESHOLD_KBPS or size > HIGH_SIZE_THRESHOLD_BYTES
     height = _number(media.get('height'))
     if not height:
         resolution = str(media.get('videoResolution') or '').casefold()
@@ -272,7 +271,7 @@ def _playback_priority(indexed_media):
             0,
         )
     return (
-        is_heavy,
+        size or float('inf'),
         codec_rank,
         container_rank,
         -height,

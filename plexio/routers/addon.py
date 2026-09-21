@@ -69,11 +69,15 @@ logger = logging.getLogger(__name__)
 _NEXT_UP_PREFIX = 'plexio:nextup-'
 _stream_prewarm_in_flight: set[str] = set()
 _STREAM_PREWARM_CONCURRENCY = 4
+_META_BATCH_CONCURRENCY = 8
 # At most this many Plex transcode sessions are started by a single pre-warm
 # cycle (catalog or detail load). Every 7.1-EAC3 row would otherwise kick its
 # own real Plex transcode; the cap keeps the shelf warm from spawning a batch of
 # abandoned transcodes on the Plex server.
 _TRANSCODE_PREWARM_CAP = 1
+# Search results pre-warm the first rows of the movie catalog response, so a
+# Play press from search results is also served from cache.
+_SEARCH_PREWARM_ITEMS = 8
 
 
 def _prewarm_warm_ids(
@@ -96,13 +100,10 @@ def _prewarm_warm_ids(
 
 
 def _prewarm_catalog_allowed(catalog_id: str) -> bool:
-    """Pre-warm only small, curated catalogs to bound background traffic."""
-    allowed = {
-        item.strip()
-        for item in settings.stream_prewarm_catalogs.split(',')
-        if item.strip()
-    }
-    return catalog_id in allowed
+    """Pre-warm all catalogs (sections, recent, collections), bounded by the
+    stream_prewarm_catalog_items / stream_prewarm_max_episodes caps and the
+    pre-warm concurrency limit + in-flight dedup."""
+    return True
 
 
 def _catalog_prewarm_targets(
@@ -116,6 +117,9 @@ def _catalog_prewarm_targets(
     On-deck catalogs warm each row's exact next-up episode (the raw on-deck
     items ARE the in-progress episodes) plus movie rows. Non-on-deck catalogs
     warm movie rows only, bounded by the configured caps.
+
+    For series catalogs (sections/collections), warm the next-up episode of
+    each show in the grid (first N shows), so grid-browsed shows are instant.
     """
     if stremio_type == StremioMediaType.movie:
         return [
@@ -135,7 +139,27 @@ def _catalog_prewarm_targets(
             if key:
                 targets.append((stremio_type, f'plexio:rk-{key}'))
         return targets[: settings.stream_prewarm_max_episodes]
+    if stremio_type == StremioMediaType.series:
+        # Series grid (sections/collections): warm next-up for first N shows
+        return [
+            (stremio_type, f'{_NEXT_UP_PREFIX}{item.id}')
+            for item in metas[: settings.stream_prewarm_catalog_items]
+            if item.id
+        ]
     return []
+
+
+def _search_prewarm_targets(
+    stremio_type: StremioMediaType, search: str, metas: list
+) -> list[tuple[StremioMediaType, str]]:
+    """Pick pre-warm targets from a search response (movie rows only)."""
+    if not search or stremio_type != StremioMediaType.movie:
+        return []
+    return [
+        (stremio_type, item.id)
+        for item in metas[: _SEARCH_PREWARM_ITEMS]
+        if item.id
+    ]
 
 
 def _schedule_stream_prewarm(
@@ -537,6 +561,29 @@ async def get_catalog(
             config_path=config_path,
             play_prefix=play_prefix,
         )
+
+    search = extras.get('search', '')
+    if (
+        settings.stream_prewarm
+        and search
+        and server_is_optimized(configuration.server_name)
+    ):
+        config_path = ''
+        play_prefix = None
+        if _uses_playback_proxy(configuration):
+            config_path = request.url.path.split('/catalog/')[0]
+            play_prefix = f'{_public_base_url(request)}{config_path}/play'
+        targets = _search_prewarm_targets(stremio_type, search, result.metas)
+        _schedule_stream_prewarm(
+            http=http,
+            cache=cache,
+            configuration=configuration,
+            namespace=configuration_cache_namespace(configuration),
+            stremio_type=stremio_type,
+            warm_ids=[media_id for _, media_id in targets],
+            config_path=config_path,
+            play_prefix=play_prefix,
+        )
     return result
 
 
@@ -559,12 +606,16 @@ async def get_meta(
     if not plex_id.startswith('plexio:'):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
 
+    namespace = configuration_cache_namespace(configuration)
+
     if is_rating_key_plexio_id(plex_id):
         media = await get_media_by_rating_key(
             client=http,
             url=configuration.discovery_url,
             token=configuration.access_token,
             rating_key=plexio_id_to_rating_key(plex_id),
+            cache=cache,
+            cache_namespace=namespace,
         )
     else:
         # Backward compatibility for previously generated plexio:<base64-guid>
@@ -579,6 +630,8 @@ async def get_meta(
             token=configuration.access_token,
             guid=guid,
             get_only_first=True,
+            cache=cache,
+            cache_namespace=namespace,
         )
     if not media:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
@@ -592,6 +645,8 @@ async def get_meta(
             url=configuration.discovery_url,
             token=configuration.access_token,
             key=media.key,
+            cache=cache,
+            cache_namespace=namespace,
         )
         meta.videos = [e.to_stremio_video_meta(configuration) for e in episodes]
 
@@ -628,6 +683,96 @@ async def get_meta(
             play_prefix=play_prefix,
         )
     return result
+
+
+async def _resolve_meta(
+    *,
+    http,
+    cache,
+    configuration,
+    namespace: str,
+    stremio_type: StremioMediaType,
+    plex_id: str,
+):
+    """Resolve full Stremio meta (with episodes for series) for one plexio id."""
+    if is_rating_key_plexio_id(plex_id):
+        media = await get_media_by_rating_key(
+            client=http,
+            url=configuration.discovery_url,
+            token=configuration.access_token,
+            rating_key=plexio_id_to_rating_key(plex_id),
+            cache=cache,
+            cache_namespace=namespace,
+        )
+    else:
+        try:
+            guid = plexio_id_to_guid(plex_id)
+        except ValueError:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND) from None
+        media = await get_media(
+            client=http,
+            url=configuration.discovery_url,
+            token=configuration.access_token,
+            guid=guid,
+            get_only_first=True,
+            cache=cache,
+            cache_namespace=namespace,
+        )
+    if not media:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
+    meta = media[0].to_stremio_meta(configuration)
+    if stremio_type == StremioMediaType.series:
+        episodes = await get_all_episodes(
+            client=http,
+            url=configuration.discovery_url,
+            token=configuration.access_token,
+            key=media[0].key,
+            cache=cache,
+            cache_namespace=namespace,
+        )
+        meta.videos = [e.to_stremio_video_meta(configuration) for e in episodes]
+    return meta
+
+
+@router.api_route(
+    '/{session_id}/meta-batch',
+    methods=['POST'],
+)
+@router.api_route(
+    '/{installation_id}/{base64_cfg}/meta-batch',
+    methods=['POST'],
+)
+async def get_meta_batch(
+    request: Request,
+    http: Annotated[ClientSession, Depends(get_http_client)],
+    cache: Annotated[Redis, Depends(get_cache)],
+    configuration: Annotated[AddonConfiguration, Depends(get_addon_configuration)],
+) -> dict:
+    body = await request.json()
+    items = body.get('items') or []
+    namespace = configuration_cache_namespace(configuration)
+    semaphore = asyncio.Semaphore(_META_BATCH_CONCURRENCY)
+
+    async def resolve_one(item: dict) -> dict:
+        stremio_type = StremioMediaType(item['type'])
+        plex_id = item['id']
+        async with semaphore:
+            try:
+                meta = await _resolve_meta(
+                    http=http,
+                    cache=cache,
+                    configuration=configuration,
+                    namespace=namespace,
+                    stremio_type=stremio_type,
+                    plex_id=plex_id,
+                )
+                return {'type': item['type'], 'id': plex_id, 'meta': meta}
+            except Exception:
+                logger.exception('meta-batch resolve failed for id=%s', plex_id)
+                return {'type': item['type'], 'id': plex_id, 'meta': None}
+
+    metas = await asyncio.gather(*(resolve_one(item) for item in items))
+    return {'metas': metas}
 
 
 async def _prewarm_transcode_sessions(
@@ -736,7 +881,7 @@ async def _warm_stream_cache(
     stream_key = resource_cache_key(
         namespace,
         'stream',
-        f'{stremio_type.value}:{media_id}:{config_path}',
+        f'{stremio_type.value}:{media_id}',
     )
     if stream_key in _stream_prewarm_in_flight:
         return
@@ -920,7 +1065,7 @@ async def get_stream(
     stream_key = resource_cache_key(
         namespace,
         'stream',
-        f'{stremio_type.value}:{media_id}:{config_path}',
+        f'{stremio_type.value}:{media_id}',
     )
 
     cache_started = perf_counter()

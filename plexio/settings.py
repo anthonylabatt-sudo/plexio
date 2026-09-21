@@ -28,10 +28,10 @@ class Settings(BaseSettings):
     redis_url: str = 'redis://redis:6379/0'
     plex_match_cache_ttl: int = Field(default=86_400, ge=0, le=2_592_000)
     plex_metadata_cache_ttl: int = Field(default=300, ge=0, le=86_400)
-    stream_cache_ttl: int = Field(default=300, ge=0, le=86_400)
+    stream_cache_ttl: int = Field(default=1800, ge=0, le=86_400)
     stream_prewarm: bool = Field(default=False)
-    stream_prewarm_max_episodes: int = Field(default=12, ge=0, le=500)
-    stream_prewarm_catalog_items: int = Field(default=5, ge=0, le=50)
+    stream_prewarm_max_episodes: int = Field(default=50, ge=0, le=500)
+    stream_prewarm_catalog_items: int = Field(default=80, ge=0, le=200)
     stream_prewarm_catalogs: str = 'plexio-ondeck,plexio-recent'
     # Route EAC3 (Dolby Digital Plus) 7.1 audio through Plex transcoding:
     # suppress the direct stream and emit a transcode URL. Clients that can't

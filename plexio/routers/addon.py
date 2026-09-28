@@ -59,6 +59,12 @@ router = APIRouter()
 router.dependencies.append(Depends(set_sentry_user))
 logger = logging.getLogger(__name__)
 
+# Marks recent viewer activity so the periodic catalog prewarm can stand
+# down when nobody has browsed or played for a while. Short TTL: presence
+# means active, absence means idle. Never used for correctness, only skip.
+PREWARM_ACTIVITY_KEY = 'plexio:prewarm:activity'
+PREWARM_ACTIVITY_TTL = 3600
+
 # Stream pre-warm: resolve and cache /stream responses when a detail page is
 # requested, so the first Play press returns from cache. In-flight keys prevent
 # duplicate concurrent resolution for the same media.
@@ -920,6 +926,9 @@ async def _warm_stream_cache(
                 return
             _stream_prewarm_in_flight.add(stream_key)
             try:
+                await cache_set(
+                    cache, PREWARM_ACTIVITY_KEY, '1', ttl=PREWARM_ACTIVITY_TTL,
+                )
                 media = await _resolve_stream_media(
                     http=http,
                     cache=cache,
@@ -1242,6 +1251,12 @@ async def post_progress_report(
                 return {'reported': False}
         if report.state not in _PROGRESS_STATES:
             return {'reported': False}
+        try:
+            await cache_set(
+                cache, PREWARM_ACTIVITY_KEY, '1', ttl=PREWARM_ACTIVITY_TTL,
+            )
+        except Exception:
+            pass
         namespace = configuration_cache_namespace(configuration)
         rating_key = None
         if media_id:

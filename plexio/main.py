@@ -9,6 +9,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from plexio.cache import init_cache
+from plexio.routers.addon import PREWARM_ACTIVITY_KEY
 from plexio.routers.addon import router as addon_router
 from plexio.routers.configuration import router as configuration_router
 from plexio.routers.plex_proxy import router as plex_proxy_router
@@ -16,6 +17,7 @@ from plexio.security import RequestBodyLimitMiddleware, SecurityHeadersMiddlewar
 from plexio.sessions import init_sessions
 from plexio.settings import settings
 from plexio.static import SPAStaticFiles
+from plexio.stream_cache import cache_get
 
 
 def before_send(event, hint):
@@ -55,6 +57,9 @@ async def _periodic_prewarm(plex_client, cache, sessions):
                 await asyncio.sleep(1500)  # 25 minutes (just before 30-min cache TTL)
             first_run = False
             if sessions is None:
+                continue
+            if await cache_get(cache, PREWARM_ACTIVITY_KEY) is None:
+                logger.info('Periodic prewarm: no recent activity, skipping')
                 continue
             # Get all active sessions
             session_list = await sessions.list()

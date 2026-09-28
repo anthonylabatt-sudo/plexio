@@ -490,6 +490,8 @@ class PlexMediaMeta(BaseModel):
             resolution_suffix = f' {resolution}' if resolution else ''
             source_details = _source_details(media, part, part_streams)
             eac3_forced = eac3_71_routing and _is_eac3_71(part_streams)
+            # Plex identity for direct-play timeline reporting (Tautulli).
+            plex_rating_key = self.key.rsplit('/', 1)[-1]
 
             audio_languages = set()
             subtitles_languages = set()
@@ -569,6 +571,8 @@ class PlexMediaMeta(BaseModel):
                                 'bingeGroup': quality_description,
                                 'filename': filename,
                                 'videoSize': video_size,
+                                'plexRatingKey': plex_rating_key,
+                                'plexKey': self.key,
                             },
                         ),
                     )
@@ -612,6 +616,8 @@ class PlexMediaMeta(BaseModel):
                             'bingeGroup': quality_description,
                             'filename': filename,
                             'videoSize': video_size,
+                            'plexRatingKey': plex_rating_key,
+                            'plexKey': self.key,
                         },
                     ),
                 )
@@ -647,6 +653,8 @@ class PlexMediaMeta(BaseModel):
                                 'bingeGroup': quality_description,
                                 'filename': filename,
                                 'videoSize': video_size,
+                                'plexRatingKey': plex_rating_key,
+                                'plexKey': self.key,
                             },
                         ),
                     )

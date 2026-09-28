@@ -30,19 +30,39 @@ sentry_sdk.init(before_send=before_send)
 
 
 import asyncio
+import logging
+
+
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
+if not logger.handlers:
+    # uvicorn's default logging leaves the root logger handler-less, so
+    # records from this logger would never reach the journal. Attach our
+    # own stderr handler instead of touching the global logging config.
+    _handler = logging.StreamHandler()
+    _handler.setFormatter(logging.Formatter('%(levelname)s: %(name)s: %(message)s'))
+    logger.addHandler(_handler)
 
 
 async def _periodic_prewarm(plex_client, cache, sessions):
     """Periodically pre-warm main sections/collections for all sessions."""
+    # Run once immediately at startup (then every 25 min), so a service
+    # restart doesn't leave a 25-minute gap with cold catalogs.
+    first_run = True
     while True:
         try:
-            await asyncio.sleep(1500)  # 25 minutes (just before 30-min cache TTL)
+            if not first_run:
+                await asyncio.sleep(1500)  # 25 minutes (just before 30-min cache TTL)
+            first_run = False
             if sessions is None:
                 continue
             # Get all active sessions
             session_list = await sessions.list()
             if not session_list:
+                logger.info('Periodic prewarm: no active sessions, skipping')
                 continue
+            warmed = 0
+            failed = 0
             for session_info in session_list:
                 session_id = session_info['session_id']
                 try:
@@ -66,15 +86,24 @@ async def _periodic_prewarm(plex_client, cache, sessions):
                                 f"{base_url}/{session_id}/catalog/{ctype}/{cid}.json",
                                 timeout=aiohttp.ClientTimeout(total=15),
                             ) as r:
-                                pass
+                                if r.status == 200:
+                                    warmed += 1
+                                else:
+                                    failed += 1
                         except Exception:
-                            pass
+                            failed += 1
                 except Exception:
-                    pass
+                    logger.exception('Periodic prewarm failed for session_id=%s', session_id)
+            logger.info(
+                'Periodic prewarm done sessions=%d warmed=%d failed=%d',
+                len(session_list),
+                warmed,
+                failed,
+            )
         except asyncio.CancelledError:
             break
         except Exception:
-            pass
+            logger.exception('Periodic prewarm pass failed')
 
 
 @asynccontextmanager

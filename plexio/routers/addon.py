@@ -6,6 +6,7 @@ from typing import Annotated
 
 from aiohttp import ClientSession
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
+from pydantic import BaseModel
 from redis.asyncio.client import Redis
 from yarl import URL
 
@@ -43,7 +44,7 @@ from plexio.plex.media_server_api import (
     get_section_media,
     stremio_to_plex_id,
 )
-from plexio.plex.playback import b64decode_path, proxy_playback
+from plexio.plex.playback import _timeline, b64decode_path, proxy_playback
 from plexio.settings import server_is_optimized, settings
 from plexio.stream_cache import (
     cache_get,
@@ -848,6 +849,31 @@ async def get_next_up_media_id(
     return f'plexio:rk-{episode}'
 
 
+async def _index_stream_filenames(cache, namespace, result) -> None:
+    """Index filename -> Plex rating key for direct-play progress reports.
+
+    TV players expose the playing file's name (not its Stremio media id),
+    so report-progress resolves those via this side index. Failures are
+    swallowed: a missing index entry just means that ping isn't reported.
+    """
+    try:
+        if not settings.stream_cache_ttl:
+            return
+        for stream in result.streams or []:
+            hints = getattr(stream, 'behavior_hints', None)
+            filename = getattr(hints, 'filename', None)
+            rating_key = getattr(hints, 'plex_rating_key', None)
+            if filename and rating_key:
+                await cache_set(
+                    cache,
+                    resource_cache_key(namespace, 'stream-by-filename', filename),
+                    rating_key,
+                    ttl=settings.stream_cache_ttl,
+                )
+    except Exception:
+        logger.exception('Filename index write failed')
+
+
 async def _warm_stream_cache(
     *,
     http,
@@ -863,75 +889,78 @@ async def _warm_stream_cache(
 ) -> None:
     if settings.stream_cache_ttl <= 0:
         return
-    if media_id.startswith(_NEXT_UP_PREFIX):
-        # Resolve the continue-watching sentinel to the real episode id BEFORE
-        # computing the cache key, so the device's actual /stream URL is the one
-        # warmed. The sentinel carries the newest-episode fallback for shows
-        # with no in-progress entry.
-        media_id = await get_next_up_media_id(
-            http=http,
-            cache=cache,
-            configuration=configuration,
-            namespace=namespace,
-            stremio_type=stremio_type,
-            media_id=media_id,
-        )
-        if not media_id:
-            return
-    stream_key = resource_cache_key(
-        namespace,
-        'stream',
-        f'{stremio_type.value}:{media_id}',
-    )
-    if stream_key in _stream_prewarm_in_flight:
-        return
+    # The sentinel resolution below also hits Plex, so the whole body runs
+    # under the semaphore: a row of items can't pile onto Plex unbounded,
+    # and Plex timeouts land in the except path instead of escaping the task.
     async with semaphore:
-        if stream_key in _stream_prewarm_in_flight:
-            return
-        if await cache_get(cache, stream_key) is not None:
-            return
-        _stream_prewarm_in_flight.add(stream_key)
         try:
-            media = await _resolve_stream_media(
-                http=http,
-                cache=cache,
-                configuration=configuration,
-                namespace=namespace,
-                stremio_type=stremio_type,
-                media_id=media_id,
-            )
-            result = StremioStreamsResponse(
-                streams=chain.from_iterable(
-                    meta.get_stremio_streams(configuration, play_prefix)
-                    for meta in media
-                ),
-            )
-            if (
-                settings.eac3_71_transcode
-                and server_is_optimized(configuration.server_name)
-            ):
-                await _prewarm_transcode_sessions(
+            if media_id.startswith(_NEXT_UP_PREFIX):
+                # Resolve the continue-watching sentinel to the real episode id BEFORE
+                # computing the cache key, so the device's actual /stream URL is the one
+                # warmed. The sentinel carries the newest-episode fallback for shows
+                # with no in-progress entry.
+                media_id = await get_next_up_media_id(
                     http=http,
+                    cache=cache,
                     configuration=configuration,
-                    streams=result.streams,
-                    transcode_budget=transcode_budget,
+                    namespace=namespace,
+                    stremio_type=stremio_type,
+                    media_id=media_id,
                 )
-            await cache_set(
-                cache,
-                stream_key,
-                serialize_stream_response(result, configuration.access_token),
-                ttl=settings.stream_cache_ttl,
+                if not media_id:
+                    return
+            stream_key = resource_cache_key(
+                namespace,
+                'stream',
+                f'{stremio_type.value}:{media_id}',
             )
-            logger.info(
-                'Stream prewarm type=%s media_id=%s streams=%d',
-                stremio_type.value,
-                media_id,
-                len(result.streams),
-            )
+            if stream_key in _stream_prewarm_in_flight:
+                return
+            if await cache_get(cache, stream_key) is not None:
+                return
+            _stream_prewarm_in_flight.add(stream_key)
+            try:
+                media = await _resolve_stream_media(
+                    http=http,
+                    cache=cache,
+                    configuration=configuration,
+                    namespace=namespace,
+                    stremio_type=stremio_type,
+                    media_id=media_id,
+                )
+                result = StremioStreamsResponse(
+                    streams=chain.from_iterable(
+                        meta.get_stremio_streams(configuration, play_prefix)
+                        for meta in media
+                    ),
+                )
+                if (
+                    settings.eac3_71_transcode
+                    and server_is_optimized(configuration.server_name)
+                ):
+                    await _prewarm_transcode_sessions(
+                        http=http,
+                        configuration=configuration,
+                        streams=result.streams,
+                        transcode_budget=transcode_budget,
+                    )
+                await cache_set(
+                    cache,
+                    stream_key,
+                    serialize_stream_response(result, configuration.access_token),
+                    ttl=settings.stream_cache_ttl,
+                )
+                await _index_stream_filenames(cache, namespace, result)
+                logger.info(
+                    'Stream prewarm type=%s media_id=%s streams=%d',
+                    stremio_type.value,
+                    media_id,
+                    len(result.streams),
+                )
+            finally:
+                _stream_prewarm_in_flight.discard(stream_key)
         except Exception:
             logger.exception('Stream prewarm failed for media_id=%s', media_id)
-        finally:
-            _stream_prewarm_in_flight.discard(stream_key)
 
 
 async def _resolve_rating_key_stream_media(
@@ -1123,6 +1152,7 @@ async def get_stream(
         serialize_stream_response(result, configuration.access_token),
         ttl=settings.stream_cache_ttl,
     )
+    await _index_stream_filenames(cache, namespace, result)
     cache_ms += (perf_counter() - cache_write_started) * 1000
     total_ms = (perf_counter() - started) * 1000
     response.headers['X-Plexio-Cache'] = 'MISS'
@@ -1168,3 +1198,94 @@ async def get_play(
         part_key=b64decode_path(part_b64),
         identifier=session_id or installation_id or 'plexio',
     )
+
+
+class ProgressReport(BaseModel):
+    """Client-reported playback position for direct-play timeline updates.
+
+    Lets TV apps report progress to Plex (Tautulli visibility, watched
+    state) while streaming bytes straight from Plex - no video bandwidth
+    through Plexio. The Plex rating key is resolved from the cached /stream
+    response, so this only reports for media the backend has already served.
+    All failures are swallowed: reporting must never affect playback.
+    """
+
+    type: str = ''
+    media_id: str = ''
+    filename: str = ''
+    state: str = 'playing'
+    time_ms: int = 0
+    duration_ms: int = 0
+    client_id: str = 'unknown'
+    product: str = 'Plexio'
+
+
+_PROGRESS_STATES = frozenset({'playing', 'paused', 'stopped', 'buffering'})
+
+
+@router.post('/{session_id}/report-progress')
+async def post_progress_report(
+    report: ProgressReport,
+    http: Annotated[ClientSession, Depends(get_http_client)],
+    cache: Annotated[Redis, Depends(get_cache)],
+    configuration: Annotated[AddonConfiguration, Depends(get_addon_configuration)],
+    session_id: str | None = None,
+):
+    try:
+        media_id = report.media_id or ''
+        filename = report.filename or ''
+        stremio_type = None
+        if media_id:
+            try:
+                stremio_type = StremioMediaType(report.type)
+            except ValueError:
+                return {'reported': False}
+        if report.state not in _PROGRESS_STATES:
+            return {'reported': False}
+        namespace = configuration_cache_namespace(configuration)
+        rating_key = None
+        if media_id:
+            stream_key = resource_cache_key(
+                namespace,
+                'stream',
+                f'{stremio_type.value}:{media_id}',
+            )
+            if settings.stream_cache_ttl:
+                cached = await cache_get(cache, stream_key)
+                if cached is not None:
+                    try:
+                        result = deserialize_stream_response(
+                            cached,
+                            configuration.access_token,
+                        )
+                    except ValueError:
+                        result = None
+                    if result is not None:
+                        for stream in result.streams:
+                            hints = getattr(stream, 'behavior_hints', None)
+                            rating_key = getattr(hints, 'plex_rating_key', None)
+                            if rating_key:
+                                break
+        if not rating_key and filename:
+            if settings.stream_cache_ttl:
+                rating_key = await cache_get(
+                    cache,
+                    resource_cache_key(namespace, 'stream-by-filename', filename),
+                )
+        if not rating_key:
+            return {'reported': False}
+        reported = await _timeline(
+            http,
+            url=configuration.discovery_url,
+            token=configuration.access_token,
+            rating_key=rating_key,
+            state=report.state,
+            time_ms=max(report.time_ms, 0),
+            duration_ms=max(report.duration_ms, 0),
+            identifier=report.client_id,
+            product=report.product,
+        )
+        return {'reported': bool(reported)}
+    except Exception:
+        logger.exception('Progress report failed')
+        return {'reported': False}

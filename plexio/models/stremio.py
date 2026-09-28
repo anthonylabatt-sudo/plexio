@@ -58,6 +58,10 @@ class StremioStreamBehaviorHints(StremioBase):
     # Used by clients for release fingerprinting (IntroDB, etc.).
     filename: str | None = None
     video_size: int | None = None  # Stremio-standard byte size of the underlying file
+    # Plex identity for direct-play timeline reporting (Tautulli visibility).
+    # Ignored by Stremio clients; read by Nuvio/Veyro players.
+    plex_rating_key: str | None = None
+    plex_key: str | None = None
 
 
 class StremioStream(StremioBase):

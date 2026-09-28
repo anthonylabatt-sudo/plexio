@@ -33,11 +33,11 @@ def _client_id(identifier: str) -> str:
     return f'plexio-{identifier}'
 
 
-def _client_headers(identifier: str) -> dict[str, str]:
+def _client_headers(identifier: str, product: str = PLEX_PRODUCT) -> dict[str, str]:
     return {
         'X-Plex-Client-Identifier': _client_id(identifier),
-        'X-Plex-Product': PLEX_PRODUCT,
-        'X-Plex-Device-Name': PLEX_PRODUCT,
+        'X-Plex-Product': product,
+        'X-Plex-Device-Name': product,
     }
 
 
@@ -51,6 +51,7 @@ async def _timeline(
     time_ms,
     duration_ms,
     identifier,
+    product: str = PLEX_PRODUCT,
 ):
     timeline_url = (url / ':/timeline').with_query(
         {
@@ -65,8 +66,11 @@ async def _timeline(
     try:
         async with client.get(
             timeline_url,
-            headers=_client_headers(identifier),
-            timeout=aiohttp.ClientTimeout(total=5),
+            headers=_client_headers(identifier, product),
+            # Generous: Oracle->Plex path can stall on DNS/TLS setup while
+            # API calls with longer budgets succeed. Pings are best-effort
+            # and async; a slow ping must not count as a failed one.
+            timeout=aiohttp.ClientTimeout(total=15),
         ) as response:
             await response.read()
             if response.status >= 400:

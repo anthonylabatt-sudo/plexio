@@ -159,6 +159,10 @@ version lookups while still reflecting library changes promptly.
 
 ## Development
 
+The configure UI uses Tailwind CSS 4 and requires Safari 16.4+, Chrome 111+,
+or Firefox 128+. Its theme is defined in `frontend/src/index.css`; Tailwind is
+built through the Vite plugin. Use Node.js 22 for frontend development and CI.
+
 ```bash
 uv run --extra dev ruff check .
 uv run --extra dev python -m unittest discover -s tests -v
@@ -166,6 +170,8 @@ cd frontend
 npm ci
 npm run lint
 npm run build
+npx playwright install --with-deps chromium webkit
+npm run test:e2e
 ```
 
 For the live development stack, copy `.env.example` to `.env` and run:
